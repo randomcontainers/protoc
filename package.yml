@@ -1,0 +1,142 @@
+name: protoc
+title: protoc
+summary: Compiles Protocol Buffers .proto files into C++, C#, Java, Kotlin, Objective-C, PHP, Python and Ruby code, and runs protoc plugins for other languages.
+homepage: https://protobuf.dev/
+license: BSD-3-Clause AND Apache-2.0 AND MIT
+upstream:
+  source: github-release
+  repository: protocolbuffers/protobuf
+  # Release tags look like v36.2; release candidates (v36.0-rc1) do not match.
+  tag-pattern: '^v(\d+\.\d+(?:\.\d+)?)$'
+  version-template: '{1}'
+  versioning: semver
+  version: "36.2"
+  artifact:
+    url: https://github.com/protocolbuffers/protobuf/releases/download/v{version}/protobuf-{version}.tar.gz
+    sha256: 3d9642a662d10e68ebae5e53f14dcce5105684212d5078f8e0d47d1ab3ae6b64
+image:
+  entrypoint: [protoc]
+  cmd: [--help]
+test:
+  - |
+    protoc --version > version.txt
+    printf 'libprotoc %s\n' "$VERSION" > version.expected
+    if ! cmp -s version.expected version.txt; then
+      echo "expected 'libprotoc $VERSION', got '$(cat version.txt)'" >&2
+      exit 1
+    fi
+  - |
+    # timestamp.proto is found in /usr/local/include without -I.
+    cat > sample.proto <<'EOF'
+    syntax = "proto3";
+
+    package demo;
+
+    import "google/protobuf/timestamp.proto";
+
+    option java_package = "com.example.demo";
+    option java_outer_classname = "SampleProto";
+
+    message Event {
+      string name = 1;
+      google.protobuf.Timestamp at = 2;
+    }
+    EOF
+    for lang in cpp python java kotlin csharp ruby php objc; do
+      mkdir -p "gen/$lang"
+    done
+    protoc --cpp_out=gen/cpp --python_out=gen/python --pyi_out=gen/python --java_out=gen/java \
+      --kotlin_out=gen/kotlin --csharp_out=gen/csharp --ruby_out=gen/ruby --php_out=gen/php \
+      --objc_out=gen/objc sample.proto
+    for f in cpp/sample.pb.h cpp/sample.pb.cc python/sample_pb2.py python/sample_pb2.pyi \
+             java/com/example/demo/SampleProto.java; do
+      if [ ! -s "gen/$f" ]; then
+        echo "protoc did not write gen/$f; it wrote:" >&2
+        find gen -type f >&2
+        exit 1
+      fi
+    done
+    for lang in kotlin csharp ruby php objc; do
+      if [ -z "$(find "gen/$lang" -type f)" ]; then
+        echo "--${lang}_out wrote no files" >&2
+        exit 1
+      fi
+    done
+    if ! grep -Fq '#include "google/protobuf/timestamp.pb.h"' gen/cpp/sample.pb.h; then
+      echo 'sample.pb.h does not include timestamp.pb.h:' >&2
+      grep '^#include' gen/cpp/sample.pb.h >&2
+      exit 1
+    fi
+  - |
+    # sample.proto is from the previous test.
+    printf '%s\n' 'name: "deploy"' 'at { seconds: 5 }' > event.txt
+    protoc --encode=demo.Event sample.proto < event.txt > event.bin
+    protoc --decode=demo.Event sample.proto < event.bin > event.decoded
+    printf '%s\n' 'name: "deploy"' 'at {' '  seconds: 5' '}' > event.expected
+    if ! cmp -s event.expected event.decoded; then
+      echo 'the decoded message differs from the input:' >&2
+      cat event.decoded >&2
+      exit 1
+    fi
+  - |
+    protoc --include_imports -o set.pb sample.proto
+    protoc --decode=google.protobuf.FileDescriptorSet google/protobuf/descriptor.proto < set.pb > set.txt
+    for name in google/protobuf/timestamp.proto sample.proto; do
+      if ! grep -Fqx "  name: \"$name\"" set.txt; then
+        echo "set.pb does not contain $name; it has:" >&2
+        grep '^  name:' set.txt >&2
+        exit 1
+      fi
+    done
+  - |
+    cat > item.proto <<'EOF'
+    edition = "2023";
+
+    package demo;
+
+    message Item {
+      string id = 1;
+      int32 count = 2 [features.field_presence = IMPLICIT];
+    }
+    EOF
+    mkdir -p editions
+    protoc --cpp_out=editions --python_out=editions item.proto
+    for f in item.pb.h item.pb.cc item_pb2.py; do
+      if [ ! -s "editions/$f" ]; then
+        echo "protoc did not write editions/$f" >&2
+        exit 1
+      fi
+    done
+  - |
+    # A plugin gets a CodeGeneratorRequest on stdin. This one keeps it and
+    # answers with an empty CodeGeneratorResponse, which generates no files.
+    printf '%s\n' '#!/bin/sh' 'cat > request.bin' > protoc-gen-noop
+    chmod +x protoc-gen-noop
+    mkdir -p noop
+    protoc --plugin=protoc-gen-noop=./protoc-gen-noop --noop_out=noop sample.proto
+    protoc --decode=google.protobuf.compiler.CodeGeneratorRequest google/protobuf/compiler/plugin.proto \
+      < request.bin > request.txt
+    if ! grep -Fqx 'file_to_generate: "sample.proto"' request.txt; then
+      echo 'the plugin did not get sample.proto to generate:' >&2
+      head -n 20 request.txt >&2
+      exit 1
+    fi
+  - |
+    printf '%s\n' 'syntax = "proto3";' 'import "missing.proto";' 'message Broken { int32 id = 1; }' > broken.proto
+    mkdir -p broken
+    if protoc --cpp_out=broken broken.proto 2> broken.log; then
+      echo 'protoc accepted an import of a file that does not exist' >&2
+      exit 1
+    fi
+    if ! grep -Fq 'missing.proto' broken.log; then
+      echo 'the error does not name missing.proto:' >&2
+      cat broken.log >&2
+      exit 1
+    fi
+examples:
+  - title: Generate Python modules and type stubs from the .proto files in proto/
+    command: mkdir -p gen && docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/protoc -I proto --python_out=gen --pyi_out=gen proto/*.proto
+  - title: Write a descriptor set with every imported file included
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/protoc -I proto --include_imports --descriptor_set_out=api.pb proto/*.proto
+  - title: Decode a binary message to text format
+    command: docker run --rm -i --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/protoc -I proto --decode=demo.Event proto/event.proto < event.bin
