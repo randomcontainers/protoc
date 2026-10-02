@@ -1,0 +1,129 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN find /lib /usr/lib -maxdepth 1 -name '*.so*' | sed 's,.*/,,' | LC_ALL=C sort -u > /tmp/base-sonames; \
+    apk add --no-cache \
+      abseil-cpp-dev \
+      build-base \
+      cmake \
+      curl \
+      pkgconf \
+      samurai
+
+ARG VERSION
+ARG SOURCE_SHA256
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+(\.[0-9]+)?' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_SHA256}" | grep -Eqx '[0-9a-f]{64}' \
+      || { echo "SOURCE_SHA256 must be the tarball's sha256" >&2; exit 1; }; \
+    url="https://github.com/protocolbuffers/protobuf/releases/download/v${VERSION}/protobuf-${VERSION}.tar.gz"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/protobuf.tar.gz "$url"; \
+    echo "${SOURCE_SHA256}  /tmp/protobuf.tar.gz" | sha256sum -c -; \
+    mkdir /src; \
+    tar -xzf /tmp/protobuf.tar.gz -C /src --strip-components=1; \
+    rm /tmp/protobuf.tar.gz; \
+    for f in CMakeLists.txt third_party/utf8_range/CMakeLists.txt; do \
+      test -f "/src/$f" || { echo "the tarball has no $f" >&2; exit 1; }; \
+    done; \
+    echo "$url" > /tmp/source-url
+
+# protoc links the static protobuf libraries it is built from and the
+# distro's shared Abseil, which has to be 20250512.1 or newer; an older one
+# fails only when compiling. With protobuf_LOCAL_DEPENDENCIES_ONLY, a missing
+# Abseil stops the configure step instead of being downloaded, and the build
+# runs without network. zlib is only used by the gzip streams of libprotobuf,
+# which protoc does not call. Only the protoc target is built, which leaves
+# out libprotobuf-lite and the upb code generators.
+ARG JOBS
+RUN --network=none set -- \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_CXX_STANDARD=17 \
+      -Dprotobuf_BUILD_TESTS=OFF \
+      -Dprotobuf_BUILD_CONFORMANCE=OFF \
+      -Dprotobuf_BUILD_EXAMPLES=OFF \
+      -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+      -Dprotobuf_LOCAL_DEPENDENCIES_ONLY=ON \
+      -Dprotobuf_WITH_ZLIB=OFF; \
+    echo "$*" > /tmp/cmake-options; \
+    cmake -S /src -B /build "$@"; \
+    cmake --build /build --target protoc -j"${JOBS:-$(nproc)}"
+
+COPY runtime-deps.alpine /tmp/runtime-deps.extra
+# CMake installs protoc as protoc-<x.y.0> plus a protoc symlink; the file is
+# renamed to protoc so that its name does not change between releases. Of the
+# headers, only the .proto files are kept: descriptor.proto, plugin.proto and
+# the well-known types, which protoc finds in the include directory next to
+# its own bin directory. runtime-deps lists the so: names of the libraries
+# protoc loads that are not in the base image: Abseil's, libstdc++ and
+# libgcc. protoc also compiles in code from Abseil's headers; the Apache
+# license text for it comes from protoc --notices.
+RUN DESTDIR=/out cmake --install /build --component protoc --strip; \
+    if [ -L /out/usr/local/bin/protoc ]; then \
+      real="$(readlink -f /out/usr/local/bin/protoc)"; \
+      rm /out/usr/local/bin/protoc; \
+      mv "$real" /out/usr/local/bin/protoc; \
+    fi; \
+    extra="$(find /out/usr/local/bin -mindepth 1 ! -path /out/usr/local/bin/protoc)"; \
+    test -z "$extra" || { echo "unexpected files in /usr/local/bin: $extra" >&2; exit 1; }; \
+    DESTDIR=/out cmake --install /build --component protobuf-headers; \
+    find /out/usr/local/include -type f ! -name '*.proto' -delete; \
+    find /out/usr/local/include -type d -empty -delete; \
+    for f in bin/protoc include/google/protobuf/descriptor.proto include/google/protobuf/timestamp.proto \
+             include/google/protobuf/compiler/plugin.proto; do \
+      test -f "/out/usr/local/$f" || { echo "the install has no /usr/local/$f" >&2; exit 1; }; \
+    done; \
+    printed="$(/out/usr/local/bin/protoc --version)"; \
+    test "$printed" = "libprotoc ${VERSION}" || { echo "protoc --version printed: $printed" >&2; exit 1; }; \
+    readelf -d /out/usr/local/bin/protoc > /tmp/protoc-dynamic; \
+    grep -q '(NEEDED).*\[libabsl_' /tmp/protoc-dynamic \
+      || { echo "protoc does not load the distro's Abseil" >&2; exit 1; }; \
+    if grep -q '(NEEDED).*\[libproto' /tmp/protoc-dynamic; then \
+      echo "protoc loads a shared protobuf library" >&2; exit 1; \
+    fi; \
+    meta=/out/usr/local/share/randomcontainers/protoc; \
+    mkdir -p "$meta/licenses"; \
+    cp /src/LICENSE "$meta/licenses/"; \
+    cp /src/third_party/utf8_range/LICENSE "$meta/licenses/LICENSE.utf8_range"; \
+    /out/usr/local/bin/protoc --notices > "$meta/licenses/NOTICES"; \
+    grep -Fq 'Apache License' "$meta/licenses/NOTICES" \
+      || { echo "protoc --notices printed no Apache license for Abseil" >&2; exit 1; }; \
+    echo "${VERSION}" > "$meta/version"; \
+    cp /tmp/source-url "$meta/source"; \
+    { \
+      echo "source-sha256=${SOURCE_SHA256}"; \
+      echo "cmake=$(cat /tmp/cmake-options)"; \
+      echo "compiler=$(c++ --version | sed -n 1p)"; \
+      echo "abseil=$(pkgconf --modversion absl_base)"; \
+    } > "$meta/buildinfo"; \
+    export LC_ALL=C; \
+    find /out/usr/local -type f | while read -r f; do \
+      if readelf -h "$f" > /dev/null 2>&1; then \
+        readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]$/\1/p'; \
+      fi; \
+    done | sort -u | while read -r so; do \
+      if [ -n "$(find /out/usr/local -name "$so")" ]; then continue; fi; \
+      if grep -qxF "$so" /tmp/base-sonames; then continue; fi; \
+      echo "so:$so"; \
+    done > /tmp/runtime-deps.elf; \
+    grep -q '^so:libabsl_' /tmp/runtime-deps.elf || { echo "no Abseil library in runtime-deps" >&2; exit 1; }; \
+    cat /tmp/runtime-deps.elf /tmp/runtime-deps.extra | sort -u > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/protoc/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "protoc"]
+CMD ["--help"]
